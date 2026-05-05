@@ -1,11 +1,9 @@
-__pycache__/
+__pycache__
 *.pyc
 *.pyo
 *.pyd
-.Python
-.venv/
-venv/
-.env
-*.log
+.git
+.gitignore
+README.md
 nginx.conf
 docker-compose.yml

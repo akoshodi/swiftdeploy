@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+import argparse
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from string import Template
+from typing import Dict, List, Tuple
+
+import urllib.request
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+MANIFEST_PATH = ROOT / "manifest.yaml"
+NGINX_OUTPUT = ROOT / "nginx.conf"
+COMPOSE_OUTPUT = ROOT / "docker-compose.yml"
+TEMPLATES_DIR = ROOT / "templates"
+
+
+REQUIRED_FIELDS = [
+    ("services", "image"),
+    ("services", "port"),
+    ("services", "mode"),
+    ("services", "app_version"),
+    ("nginx", "image"),
+    ("nginx", "port"),
+    ("nginx", "proxy_timeout"),
+    ("network", "name"),
+    ("network", "driver_type"),
+]
+
+
+def print_result(name: str, ok: bool, details: str) -> None:
+    status = "PASS" if ok else "FAIL"
+    print(f"[{status}] {name}: {details}")
+
+
+def run_command(cmd: List[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        cwd=ROOT,
+        check=check,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def load_manifest() -> Dict:
+    if not MANIFEST_PATH.exists():
+        raise FileNotFoundError("manifest.yaml was not found in the project root")
+
+    with MANIFEST_PATH.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+
+    if not isinstance(data, dict):
+        raise ValueError("manifest.yaml must define a YAML mapping at the root")
+
+    return data
+
+
+def required_fields_valid(manifest: Dict) -> Tuple[bool, str]:
+    for section, key in REQUIRED_FIELDS:
+        section_data = manifest.get(section)
+        if not isinstance(section_data, dict):
+            return False, f"section '{section}' is missing or invalid"
+
+        value = section_data.get(key)
+        if value is None:
+            return False, f"field '{section}.{key}' is missing"
+
+        if isinstance(value, str) and not value.strip():
+            return False, f"field '{section}.{key}' cannot be empty"
+
+    if str(manifest["services"]["mode"]).strip().lower() not in {"stable", "canary"}:
+        return False, "services.mode must be 'stable' or 'canary'"
+
+    return True, "all required fields are present"
+
+
+def render_template(path: Path, values: Dict[str, str]) -> str:
+    content = path.read_text(encoding="utf-8")
+    return Template(content).safe_substitute(values)
+
+
+def template_values(manifest: Dict) -> Dict[str, str]:
+    services = manifest["services"]
+    nginx = manifest["nginx"]
+    network = manifest["network"]
+    volumes = manifest.get("volumes", {})
+
+    return {
+        "SERVICE_IMAGE": str(services["image"]),
+        "SERVICE_PORT": str(services["port"]),
+        "MODE": str(services["mode"]).lower(),
+        "APP_VERSION": str(services["app_version"]),
+        "SERVICE_CONTAINER": str(services.get("container_name", "swiftdeploy-app")),
+        "SERVICE_RESTART": str(services.get("restart", "unless-stopped")),
+        "NGINX_IMAGE": str(nginx["image"]),
+        "NGINX_PORT": str(nginx["port"]),
+        "PROXY_TIMEOUT": str(nginx["proxy_timeout"]),
+        "NGINX_CONTAINER": str(nginx.get("container_name", "swiftdeploy-nginx")),
+        "NGINX_RESTART": str(nginx.get("restart", "unless-stopped")),
+        "SERVICE_NAME": str(nginx.get("service_name", "swiftdeploy-api")),
+        "CONTACT": str(nginx.get("contact", "devops@swiftdeploy.local")),
+        "NETWORK_NAME": str(network["name"]),
+        "NETWORK_DRIVER": str(network["driver_type"]),
+        "APP_LOGS_VOLUME": str(volumes.get("app_logs", "swiftdeploy-app-logs")),
+        "NGINX_LOGS_VOLUME": str(volumes.get("nginx_logs", "swiftdeploy-nginx-logs")),
+    }
+
+
+def generate_configs(manifest: Dict) -> None:
+    values = template_values(manifest)
+    nginx_content = render_template(TEMPLATES_DIR / "nginx.conf.tmpl", values)
+    compose_content = render_template(TEMPLATES_DIR / "docker-compose.yml.tmpl", values)
+
+    NGINX_OUTPUT.write_text(nginx_content, encoding="utf-8")
+    COMPOSE_OUTPUT.write_text(compose_content, encoding="utf-8")
+
+    print(f"Generated {NGINX_OUTPUT.name}")
+    print(f"Generated {COMPOSE_OUTPUT.name}")
+
+
+def check_yaml_exists_and_valid() -> Tuple[bool, str, Dict]:
+    try:
+        manifest = load_manifest()
+        return True, "manifest.yaml exists and is valid YAML", manifest
+    except Exception as exc:
+        return False, str(exc), {}
+
+
+def check_image_exists(manifest: Dict) -> Tuple[bool, str]:
+    if shutil.which("docker") is None:
+        return False, "docker CLI is not available in PATH"
+
+    image = str(manifest["services"]["image"])
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return False, "docker CLI is not available in PATH"
+
+    if result.returncode == 0:
+        return True, f"docker image found locally: {image}"
+
+    return False, f"docker image not found locally: {image}"
+
+
+def check_port_free(manifest: Dict) -> Tuple[bool, str]:
+    port = int(manifest["nginx"]["port"])
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("0.0.0.0", port))
+        return True, f"port {port} is available"
+    except OSError:
+        return False, f"port {port} is already in use"
+    finally:
+        sock.close()
+
+
+def check_nginx_syntax(manifest: Dict) -> Tuple[bool, str]:
+    if shutil.which("docker") is None:
+        return False, "docker CLI is not available in PATH"
+
+    values = template_values(manifest)
+    content = render_template(TEMPLATES_DIR / "nginx.conf.tmpl", values)
+
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".conf") as tf:
+        tf.write(content)
+        temp_path = tf.name
+
+    try:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{temp_path}:/etc/nginx/nginx.conf:ro",
+                    str(manifest["nginx"]["image"]),
+                    "nginx",
+                    "-t",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            return False, "docker CLI is not available in PATH"
+        if result.returncode == 0:
+            return True, "generated nginx.conf passed nginx -t"
+
+        return False, (result.stderr or result.stdout).strip()
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+
+
+def run_validate(args: argparse.Namespace) -> int:
+    checks_ok = True
+
+    ok, details, manifest = check_yaml_exists_and_valid()
+    print_result("Manifest exists and is valid YAML", ok, details)
+    checks_ok = checks_ok and ok
+
+    if not ok:
+        return 1
+
+    ok, details = required_fields_valid(manifest)
+    print_result("Required fields are present and non-empty", ok, details)
+    checks_ok = checks_ok and ok
+
+    ok, details = check_image_exists(manifest)
+    print_result("Service image exists locally", ok, details)
+    checks_ok = checks_ok and ok
+
+    ok, details = check_port_free(manifest)
+    print_result("Nginx port is not already bound", ok, details)
+    checks_ok = checks_ok and ok
+
+    ok, details = check_nginx_syntax(manifest)
+    print_result("Generated nginx.conf syntax is valid", ok, details)
+    checks_ok = checks_ok and ok
+
+    return 0 if checks_ok else 1
+
+
+def run_init(args: argparse.Namespace) -> int:
+    manifest = load_manifest()
+    ok, details = required_fields_valid(manifest)
+    if not ok:
+        print(f"manifest validation failed: {details}")
+        return 1
+
+    generate_configs(manifest)
+    return 0
+
+
+def wait_for_health(port: int, expected_mode: str = "", timeout_seconds: int = 60) -> bool:
+    deadline = time.time() + timeout_seconds
+    url = f"http://127.0.0.1:{port}/healthz"
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                data = yaml.safe_load(response.read().decode("utf-8"))
+                if not isinstance(data, dict):
+                    continue
+
+                status_ok = data.get("status") == "ok"
+                if not expected_mode:
+                    if status_ok:
+                        print(f"Health check passed: {data}")
+                        return True
+                else:
+                    if status_ok and str(data.get("mode", "")).lower() == expected_mode.lower():
+                        print(f"Health check passed in mode {expected_mode}: {data}")
+                        return True
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+    return False
+
+
+def run_deploy(args: argparse.Namespace) -> int:
+    init_rc = run_init(args)
+    if init_rc != 0:
+        return init_rc
+
+    validate_rc = run_validate(args)
+    if validate_rc != 0:
+        return validate_rc
+
+    run_command(["docker", "compose", "up", "-d"])
+
+    manifest = load_manifest()
+    nginx_port = int(manifest["nginx"]["port"])
+
+    print("Waiting for service health checks to pass...")
+    if not wait_for_health(nginx_port, timeout_seconds=60):
+        print("Deployment failed: health checks did not pass within 60 seconds")
+        return 1
+
+    print("Deployment successful")
+    return 0
+
+
+def run_promote(args: argparse.Namespace) -> int:
+    target_mode = args.mode.lower()
+    if target_mode not in {"stable", "canary"}:
+        print("mode must be either 'stable' or 'canary'")
+        return 1
+
+    manifest = load_manifest()
+    manifest["services"]["mode"] = target_mode
+
+    with MANIFEST_PATH.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(manifest, handle, sort_keys=False)
+
+    print(f"Updated manifest.yaml mode to {target_mode}")
+
+    init_rc = run_init(args)
+    if init_rc != 0:
+        return init_rc
+
+    run_command(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "app"])
+
+    nginx_port = int(manifest["nginx"]["port"])
+    print(f"Confirming mode is active via /healthz (target={target_mode})...")
+    if not wait_for_health(nginx_port, expected_mode=target_mode, timeout_seconds=60):
+        print("Mode promotion failed: expected mode was not observed on /healthz")
+        return 1
+
+    print(f"Promotion successful: deployment is now in {target_mode} mode")
+    return 0
+
+
+def run_teardown(args: argparse.Namespace) -> int:
+    run_command(["docker", "compose", "down", "-v", "--remove-orphans"], check=False)
+    print("Containers, networks, and volumes removed")
+
+    if args.clean:
+        for path in [NGINX_OUTPUT, COMPOSE_OUTPUT]:
+            if path.exists():
+                path.unlink()
+                print(f"Deleted generated file: {path.name}")
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SwiftDeploy CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("init", help="Generate nginx.conf and docker-compose.yml from manifest")
+    subparsers.add_parser("validate", help="Run pre-flight checks")
+    subparsers.add_parser("deploy", help="Initialize and deploy the stack")
+
+    promote = subparsers.add_parser("promote", help="Promote deployment mode")
+    promote.add_argument("mode", choices=["stable", "canary"], help="Target deployment mode")
+
+    teardown = subparsers.add_parser("teardown", help="Tear down stack resources")
+    teardown.add_argument("--clean", action="store_true", help="Delete generated config files")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    handlers = {
+        "init": run_init,
+        "validate": run_validate,
+        "deploy": run_deploy,
+        "promote": run_promote,
+        "teardown": run_teardown,
+    }
+
+    handler = handlers[args.command]
+    return handler(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1)
+    except subprocess.CalledProcessError as exc:
+        print(exc.stdout or "", end="")
+        print(exc.stderr or "", end="")
+        print(f"Command failed with exit code {exc.returncode}")
+        raise SystemExit(exc.returncode)
+    except KeyboardInterrupt:
+        print("Interrupted")
+        raise SystemExit(130)
