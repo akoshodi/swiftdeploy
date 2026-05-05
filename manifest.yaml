@@ -1,0 +1,24 @@
+services:
+  image: swift-deploy-1-node:latest
+  port: 3000
+  mode: stable
+  app_version: "1.0.0"
+  container_name: swiftdeploy-app
+  restart: unless-stopped
+
+nginx:
+  image: nginx:latest
+  port: 8080
+  proxy_timeout: 30s
+  container_name: swiftdeploy-nginx
+  restart: unless-stopped
+  service_name: swiftdeploy-api
+  contact: devops@swiftdeploy.local
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
+
+volumes:
+  app_logs: swiftdeploy-app-logs
+  nginx_logs: swiftdeploy-nginx-logs

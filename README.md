@@ -1,0 +1,3 @@
+# SwiftDeploy
+
+Project scaffold initialized.
