@@ -97,6 +97,7 @@ def add_canary_header(response):
         for bucket in LATENCY_BUCKETS:
             if duration <= bucket:
                 LATENCY_BUCKET_COUNTER[bucket] = LATENCY_BUCKET_COUNTER.get(bucket, 0) + 1
+                break
 
     if is_canary():
         response.headers["X-Mode"] = "canary"
