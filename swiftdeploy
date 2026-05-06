@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
 import argparse
+import json
+import math
+import os
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
-from typing import Dict, List, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
+import urllib.error
 import urllib.request
 import yaml
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 ROOT = Path(__file__).resolve().parent
 MANIFEST_PATH = ROOT / "manifest.yaml"
 NGINX_OUTPUT = ROOT / "nginx.conf"
 COMPOSE_OUTPUT = ROOT / "docker-compose.yml"
 TEMPLATES_DIR = ROOT / "templates"
+POLICIES_DIR = ROOT / "policies"
+POLICY_DATA_OUTPUT = ROOT / "policy-data.json"
+HISTORY_FILE = ROOT / "history.jsonl"
+AUDIT_REPORT = ROOT / "audit_report.md"
 
 
 REQUIRED_FIELDS = [
@@ -30,6 +45,21 @@ REQUIRED_FIELDS = [
     ("nginx", "proxy_timeout"),
     ("network", "name"),
     ("network", "driver_type"),
+]
+
+STANDARD_HISTOGRAM_BUCKETS = [
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    float("inf"),
 ]
 
 
@@ -61,6 +91,10 @@ def load_manifest() -> Dict:
     return data
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def required_fields_valid(manifest: Dict) -> Tuple[bool, str]:
     for section, key in REQUIRED_FIELDS:
         section_data = manifest.get(section)
@@ -89,6 +123,7 @@ def template_values(manifest: Dict) -> Dict[str, str]:
     services = manifest["services"]
     nginx = manifest["nginx"]
     network = manifest["network"]
+    opa = manifest.get("opa", {})
     volumes = manifest.get("volumes", {})
 
     return {
@@ -109,6 +144,30 @@ def template_values(manifest: Dict) -> Dict[str, str]:
         "NETWORK_DRIVER": str(network["driver_type"]),
         "APP_LOGS_VOLUME": str(volumes.get("app_logs", "swiftdeploy-app-logs")),
         "NGINX_LOGS_VOLUME": str(volumes.get("nginx_logs", "swiftdeploy-nginx-logs")),
+        "OPA_IMAGE": str(opa.get("image", "openpolicyagent/opa:0.67.1-static")),
+        "OPA_HOST_PORT": str(opa.get("host_port", 8181)),
+        "OPA_CONTAINER": str(opa.get("container_name", "swiftdeploy-opa")),
+        "OPA_RESTART": str(opa.get("restart", "unless-stopped")),
+    }
+
+
+def policy_data(manifest: Dict) -> Dict[str, Any]:
+    policy = manifest.get("policy", {})
+    infra = policy.get("infrastructure", {})
+    canary = policy.get("canary_safety", {})
+
+    return {
+        "config": {
+            "infrastructure": {
+                "min_disk_free_gb": float(infra.get("min_disk_free_gb", 10.0)),
+                "max_cpu_load": float(infra.get("max_cpu_load", 2.0)),
+            },
+            "canary_safety": {
+                "max_error_rate_pct": float(canary.get("max_error_rate_pct", 1.0)),
+                "max_p99_latency_ms": float(canary.get("max_p99_latency_ms", 500.0)),
+                "window_seconds": int(canary.get("window_seconds", 30)),
+            },
+        }
     }
 
 
@@ -119,9 +178,18 @@ def generate_configs(manifest: Dict) -> None:
 
     NGINX_OUTPUT.write_text(nginx_content, encoding="utf-8")
     COMPOSE_OUTPUT.write_text(compose_content, encoding="utf-8")
+    POLICY_DATA_OUTPUT.write_text(json.dumps(policy_data(manifest), indent=2), encoding="utf-8")
 
     print(f"Generated {NGINX_OUTPUT.name}")
     print(f"Generated {COMPOSE_OUTPUT.name}")
+    print(f"Generated {POLICY_DATA_OUTPUT.name}")
+
+
+def append_history(entry: Dict[str, Any]) -> None:
+    row = dict(entry)
+    row.setdefault("timestamp", utc_now())
+    with HISTORY_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, separators=(",", ":")) + "\n")
 
 
 def check_yaml_exists_and_valid() -> Tuple[bool, str, Dict]:
@@ -183,8 +251,6 @@ def check_nginx_syntax(manifest: Dict) -> Tuple[bool, str]:
                     "docker",
                     "run",
                     "--rm",
-                    "--add-host",
-                    "app:127.0.0.1",
                     "-v",
                     f"{temp_path}:/etc/nginx/nginx.conf:ro",
                     str(manifest["nginx"]["image"]),
@@ -242,7 +308,339 @@ def run_init(args: argparse.Namespace) -> int:
         return 1
 
     generate_configs(manifest)
+
+    if not POLICIES_DIR.exists() or not any(POLICIES_DIR.glob("*.rego")):
+        print("init failed: policies directory must contain at least one .rego file")
+        return 1
+
     return 0
+
+
+def docker_available() -> bool:
+    return shutil.which("docker") is not None
+
+
+def opa_host_port(manifest: Dict) -> int:
+    return int(manifest.get("opa", {}).get("host_port", 8181))
+
+
+def http_json(url: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 5.0) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    headers = {"Content-Type": "application/json"}
+    data = None
+    method = "GET"
+    if payload is not None:
+        method = "POST"
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(url=url, method=method, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                return False, None, "invalid non-object JSON payload"
+            return True, parsed, "ok"
+    except urllib.error.HTTPError as exc:
+        return False, None, f"http {exc.code} from OPA endpoint"
+    except urllib.error.URLError as exc:
+        reason = str(exc.reason)
+        if "timed out" in reason.lower():
+            return False, None, "connection to OPA timed out"
+        if "refused" in reason.lower():
+            return False, None, "connection to OPA was refused"
+        return False, None, f"network error contacting OPA: {reason}"
+    except json.JSONDecodeError:
+        return False, None, "OPA returned invalid JSON"
+    except TimeoutError:
+        return False, None, "connection to OPA timed out"
+    except Exception as exc:
+        return False, None, f"unexpected OPA error: {exc}"
+
+
+def ensure_opa_ready(manifest: Dict, timeout_seconds: int = 20) -> Tuple[bool, str]:
+    if not docker_available():
+        return False, "docker CLI is not available in PATH"
+
+    try:
+        run_command(["docker", "compose", "up", "-d", "opa"], check=True)
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or "").strip()
+        return False, f"failed to start OPA container: {details or 'docker compose up -d opa failed'}"
+
+    port = opa_host_port(manifest)
+    url = f"http://127.0.0.1:{port}/v1/data"
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        ok, _, msg = http_json(url, timeout=2.0)
+        if ok:
+            return True, "OPA is reachable"
+        if "invalid" in msg.lower():
+            return True, "OPA is reachable"
+        time.sleep(1)
+
+    return False, "OPA did not become ready before timeout"
+
+
+def evaluate_policy_domain(manifest: Dict, domain: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    port = opa_host_port(manifest)
+    url = f"http://127.0.0.1:{port}/v1/data/swiftdeploy/{domain}/decision"
+    ok, body, msg = http_json(url, payload={"input": payload}, timeout=5.0)
+
+    if not ok:
+        return {
+            "domain": domain,
+            "status": "error",
+            "allow": False,
+            "reasons": [msg],
+            "violations": [f"opa_unavailable_{domain}"],
+        }
+
+    result = body.get("result") if isinstance(body, dict) else None
+    if not isinstance(result, dict):
+        return {
+            "domain": domain,
+            "status": "error",
+            "allow": False,
+            "reasons": ["OPA response missing decision result object"],
+            "violations": [f"opa_invalid_response_{domain}"],
+        }
+
+    allow = bool(result.get("allow", False))
+    reasons = result.get("reasons", [])
+    violations = result.get("violations", [])
+    if not isinstance(reasons, list):
+        reasons = [str(reasons)]
+    if not isinstance(violations, list):
+        violations = [str(violations)]
+
+    return {
+        "domain": domain,
+        "status": "ok",
+        "allow": allow,
+        "reasons": [str(x) for x in reasons],
+        "violations": [str(x) for x in violations],
+        "observed": result.get("observed", {}),
+    }
+
+
+def print_policy_signal(signal: Dict[str, Any]) -> None:
+    domain = signal.get("domain", "unknown")
+    status = str(signal.get("status", "error")).upper()
+    allow = bool(signal.get("allow", False))
+    gate = "ALLOW" if allow else "DENY"
+    print(f"[{status}] policy:{domain} => {gate}")
+    for reason in signal.get("reasons", []):
+        print(f"  - {reason}")
+    violations = signal.get("violations", [])
+    if violations:
+        print("  Violations:")
+        for item in violations:
+            print(f"  - {item}")
+
+
+def enforce_policy_gate(manifest: Dict, domain: str, payload: Dict[str, Any], context: str) -> Tuple[bool, Dict[str, Any]]:
+    signal = evaluate_policy_domain(manifest, domain, payload)
+    append_history(
+        {
+            "source": context,
+            "kind": "policy_check",
+            "domain": domain,
+            "payload": payload,
+            "result": signal,
+        }
+    )
+    print_policy_signal(signal)
+    return bool(signal.get("allow", False)), signal
+
+
+def collect_host_stats() -> Dict[str, Any]:
+    disk = shutil.disk_usage(ROOT)
+    disk_free_gb = disk.free / (1024**3)
+
+    if hasattr(os, "getloadavg"):
+        cpu_load = float(os.getloadavg()[0])
+    elif psutil is not None:
+        cpu_pct = float(psutil.cpu_percent(interval=0.2))
+        cpu_count = max(int(psutil.cpu_count() or 1), 1)
+        cpu_load = (cpu_pct / 100.0) * cpu_count
+    else:
+        cpu_load = 0.0
+
+    mem_total_gb = 0.0
+    mem_available_gb = 0.0
+    if psutil is not None:
+        vm = psutil.virtual_memory()
+        mem_total_gb = vm.total / (1024**3)
+        mem_available_gb = vm.available / (1024**3)
+
+    return {
+        "disk_free_gb": round(disk_free_gb, 3),
+        "cpu_load": round(cpu_load, 3),
+        "mem_total_gb": round(mem_total_gb, 3),
+        "mem_available_gb": round(mem_available_gb, 3),
+    }
+
+
+def parse_metric_labels(label_blob: str) -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+    parts = [p.strip() for p in label_blob.split(",") if p.strip()]
+    for item in parts:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        labels[key.strip()] = value.strip().strip('"')
+    return labels
+
+
+def scrape_metrics(port: int) -> Tuple[bool, Dict[str, Any], str]:
+    url = f"http://127.0.0.1:{port}/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        return False, {}, f"metrics endpoint unreachable: {exc.reason}"
+    except Exception as exc:
+        return False, {}, f"metrics scrape failed: {exc}"
+
+    total_requests = 0
+    error_requests = 0
+    histogram: Dict[float, float] = {}
+    app_mode_value = 0.0
+    chaos_value = 0.0
+    uptime_seconds = 0.0
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("http_requests_total{"):
+            label_part, value_part = line.split("}", 1)
+            labels = parse_metric_labels(label_part.split("{", 1)[1])
+            count = float(value_part.strip())
+            total_requests += count
+            status = labels.get("status_code", "")
+            if status.startswith("5"):
+                error_requests += count
+            continue
+
+        if line.startswith("http_request_duration_seconds_bucket{"):
+            label_part, value_part = line.split("}", 1)
+            labels = parse_metric_labels(label_part.split("{", 1)[1])
+            le = labels.get("le", "+Inf")
+            upper = float("inf") if le == "+Inf" else float(le)
+            histogram[upper] = float(value_part.strip())
+            continue
+
+        if line.startswith("app_mode"):
+            app_mode_value = float(line.split()[-1])
+            continue
+
+        if line.startswith("chaos_active"):
+            chaos_value = float(line.split()[-1])
+            continue
+
+        if line.startswith("app_uptime_seconds"):
+            uptime_seconds = float(line.split()[-1])
+            continue
+
+    for bucket in STANDARD_HISTOGRAM_BUCKETS:
+        histogram.setdefault(bucket, 0.0)
+
+    return (
+        True,
+        {
+            "timestamp": time.time(),
+            "total_requests": total_requests,
+            "error_requests": error_requests,
+            "histogram_cumulative": histogram,
+            "app_mode": "canary" if int(app_mode_value) == 1 else "stable",
+            "chaos_active": int(chaos_value),
+            "uptime_seconds": uptime_seconds,
+        },
+        "ok",
+    )
+
+
+def quantile_from_cumulative(histogram: Dict[float, float], quantile: float) -> float:
+    if not histogram:
+        return 0.0
+
+    ordered = sorted(histogram.items(), key=lambda x: x[0])
+    total = ordered[-1][1]
+    if total <= 0:
+        return 0.0
+
+    target = total * quantile
+    last_finite = 0.0
+    for upper, cumulative in ordered:
+        if not math.isinf(upper):
+            last_finite = float(upper)
+        if cumulative >= target:
+            if math.isinf(upper):
+                return last_finite
+            return float(upper)
+    return last_finite
+
+
+def window_signals(samples: List[Dict[str, Any]]) -> Dict[str, float]:
+    if len(samples) < 2:
+        latest = samples[-1] if samples else {}
+        latest_p99 = quantile_from_cumulative(latest.get("histogram_cumulative", {}), 0.99)
+        return {
+            "request_rate": 0.0,
+            "error_rate_pct": 0.0,
+            "p99_latency_ms": latest_p99 * 1000,
+        }
+
+    first = samples[0]
+    last = samples[-1]
+    dt = max(last["timestamp"] - first["timestamp"], 1e-6)
+
+    total_delta = max(0.0, last["total_requests"] - first["total_requests"])
+    error_delta = max(0.0, last["error_requests"] - first["error_requests"])
+    req_rate = total_delta / dt
+    error_rate_pct = (error_delta / total_delta * 100.0) if total_delta > 0 else 0.0
+
+    first_hist = first.get("histogram_cumulative", {})
+    last_hist = last.get("histogram_cumulative", {})
+    delta_hist: Dict[float, float] = {}
+    for bucket in STANDARD_HISTOGRAM_BUCKETS:
+        delta_hist[bucket] = max(0.0, last_hist.get(bucket, 0.0) - first_hist.get(bucket, 0.0))
+
+    p99 = quantile_from_cumulative(delta_hist, 0.99)
+    return {
+        "request_rate": req_rate,
+        "error_rate_pct": error_rate_pct,
+        "p99_latency_ms": p99 * 1000,
+    }
+
+
+def gather_promote_signals(port: int, window_seconds: int) -> Tuple[bool, Dict[str, Any], str]:
+    deadline = time.time() + max(5, window_seconds)
+    samples: List[Dict[str, Any]] = []
+
+    while time.time() <= deadline:
+        ok, sample, msg = scrape_metrics(port)
+        if not ok:
+            return False, {}, msg
+        samples.append(sample)
+        if time.time() >= deadline:
+            break
+        time.sleep(5)
+
+    if not samples:
+        return False, {}, "no metrics were collected"
+
+    signals = window_signals(samples)
+    observed = {
+        "current_mode": samples[-1]["app_mode"],
+        "chaos_active": samples[-1]["chaos_active"],
+        "window_seconds": window_seconds,
+        "error_rate_pct": round(signals["error_rate_pct"], 4),
+        "p99_latency_ms": round(signals["p99_latency_ms"], 3),
+    }
+    return True, observed, "ok"
 
 
 def wait_for_health(port: int, expected_mode: str = "", timeout_seconds: int = 60) -> bool:
@@ -282,9 +680,24 @@ def run_deploy(args: argparse.Namespace) -> int:
     if validate_rc != 0:
         return validate_rc
 
-    run_command(["docker", "compose", "up", "-d"])
-
     manifest = load_manifest()
+    opa_ok, opa_msg = ensure_opa_ready(manifest)
+    if not opa_ok:
+        print(f"pre-deploy policy gate failed: {opa_msg}")
+        append_history({"source": "deploy", "kind": "opa_error", "message": opa_msg})
+        return 1
+
+    pre_deploy_input = {
+        "context": "pre-deploy",
+        "host": collect_host_stats(),
+    }
+    allowed, _ = enforce_policy_gate(manifest, "infrastructure", pre_deploy_input, "pre-deploy")
+    if not allowed:
+        print("Deployment blocked by OPA infrastructure policy")
+        return 1
+
+    run_command(["docker", "compose", "up", "-d", "app", "nginx", "opa"])
+
     nginx_port = int(manifest["nginx"]["port"])
 
     print("Waiting for service health checks to pass...")
@@ -292,6 +705,11 @@ def run_deploy(args: argparse.Namespace) -> int:
         print("Deployment failed: health checks did not pass within 60 seconds")
         return 1
 
+    append_history({
+        "source": "deploy",
+        "kind": "deploy_success",
+        "mode": manifest["services"]["mode"],
+    })
     print("Deployment successful")
     return 0
 
@@ -303,11 +721,37 @@ def run_promote(args: argparse.Namespace) -> int:
         return 1
 
     manifest = load_manifest()
-    manifest["services"]["mode"] = target_mode
+    current_mode = str(manifest["services"]["mode"]).strip().lower()
 
+    opa_ok, opa_msg = ensure_opa_ready(manifest)
+    if not opa_ok:
+        print(f"pre-promote policy gate failed: {opa_msg}")
+        append_history({"source": "promote", "kind": "opa_error", "message": opa_msg})
+        return 1
+
+    nginx_port = int(manifest["nginx"]["port"])
+    policy_cfg = policy_data(manifest)
+    window_seconds = int(policy_cfg["config"]["canary_safety"]["window_seconds"])
+    print(f"Collecting canary health signals for {window_seconds}s...")
+    ok, observed, msg = gather_promote_signals(nginx_port, window_seconds)
+    if not ok:
+        print(f"pre-promote metrics collection failed: {msg}")
+        append_history({"source": "promote", "kind": "metrics_error", "message": msg})
+        return 1
+
+    pre_promote_input = {
+        "context": "pre-promote",
+        "target_mode": target_mode,
+        "observed": observed,
+    }
+    allowed, _ = enforce_policy_gate(manifest, "canary_safety", pre_promote_input, "pre-promote")
+    if not allowed:
+        print("Promotion blocked by OPA canary safety policy")
+        return 1
+
+    manifest["services"]["mode"] = target_mode
     with MANIFEST_PATH.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(manifest, handle, sort_keys=False)
-
     print(f"Updated manifest.yaml mode to {target_mode}")
 
     init_rc = run_init(args)
@@ -316,12 +760,19 @@ def run_promote(args: argparse.Namespace) -> int:
 
     run_command(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "app"])
 
-    nginx_port = int(manifest["nginx"]["port"])
     print(f"Confirming mode is active via /healthz (target={target_mode})...")
     if not wait_for_health(nginx_port, expected_mode=target_mode, timeout_seconds=60):
         print("Mode promotion failed: expected mode was not observed on /healthz")
         return 1
 
+    append_history(
+        {
+            "source": "promote",
+            "kind": "mode_change",
+            "from": current_mode,
+            "to": target_mode,
+        }
+    )
     print(f"Promotion successful: deployment is now in {target_mode} mode")
     return 0
 
@@ -331,11 +782,207 @@ def run_teardown(args: argparse.Namespace) -> int:
     print("Containers, networks, and volumes removed")
 
     if args.clean:
-        for path in [NGINX_OUTPUT, COMPOSE_OUTPUT]:
+        for path in [NGINX_OUTPUT, COMPOSE_OUTPUT, POLICY_DATA_OUTPUT]:
             if path.exists():
                 path.unlink()
                 print(f"Deleted generated file: {path.name}")
 
+    return 0
+
+
+def run_status(args: argparse.Namespace) -> int:
+    manifest = load_manifest()
+    nginx_port = int(manifest["nginx"]["port"])
+    interval = max(1, int(args.interval))
+    max_samples = int(args.samples)
+
+    opa_ok, opa_msg = ensure_opa_ready(manifest)
+    if not opa_ok:
+        print(f"status warning: {opa_msg}")
+
+    rolling: Deque[Dict[str, Any]] = deque(maxlen=200)
+    count = 0
+
+    try:
+        while True:
+            ok, metrics, msg = scrape_metrics(nginx_port)
+            if not ok:
+                print(f"status scrape failed: {msg}")
+                append_history({"source": "status", "kind": "scrape_error", "message": msg})
+                return 1
+
+            rolling.append(metrics)
+            now_ts = time.time()
+            while rolling and (now_ts - rolling[0]["timestamp"]) > 30:
+                rolling.popleft()
+
+            signals = window_signals(list(rolling))
+            host = collect_host_stats()
+
+            infra_input = {"context": "status", "host": host}
+            canary_input = {
+                "context": "status",
+                "observed": {
+                    "current_mode": metrics["app_mode"],
+                    "chaos_active": metrics["chaos_active"],
+                    "window_seconds": 30,
+                    "error_rate_pct": round(signals["error_rate_pct"], 4),
+                    "p99_latency_ms": round(signals["p99_latency_ms"], 3),
+                },
+            }
+
+            infra_signal = evaluate_policy_domain(manifest, "infrastructure", infra_input)
+            canary_signal = evaluate_policy_domain(manifest, "canary_safety", canary_input)
+
+            os.system("cls" if os.name == "nt" else "clear")
+            print("SwiftDeploy Status Dashboard")
+            print(f"Timestamp: {utc_now()}")
+            print(f"Mode: {metrics['app_mode']} | Chaos: {metrics['chaos_active']} | Uptime: {int(metrics['uptime_seconds'])}s")
+            print(f"Req/s (30s): {signals['request_rate']:.3f}")
+            print(f"Error Rate (30s): {signals['error_rate_pct']:.3f}%")
+            print(f"P99 Latency (30s): {signals['p99_latency_ms']:.2f}ms")
+            print("")
+            print("Policy Compliance:")
+            print(f"- infrastructure: {'PASS' if infra_signal['allow'] else 'FAIL'}")
+            for reason in infra_signal.get("reasons", []):
+                print(f"  {reason}")
+            print(f"- canary_safety: {'PASS' if canary_signal['allow'] else 'FAIL'}")
+            for reason in canary_signal.get("reasons", []):
+                print(f"  {reason}")
+
+            append_history(
+                {
+                    "source": "status",
+                    "kind": "scrape",
+                    "mode": metrics["app_mode"],
+                    "chaos_active": metrics["chaos_active"],
+                    "req_rate": round(signals["request_rate"], 6),
+                    "error_rate_pct": round(signals["error_rate_pct"], 6),
+                    "p99_latency_ms": round(signals["p99_latency_ms"], 6),
+                    "total_requests": metrics["total_requests"],
+                    "error_requests": metrics["error_requests"],
+                    "policies": [infra_signal, canary_signal],
+                }
+            )
+
+            count += 1
+            if max_samples > 0 and count >= max_samples:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("status stopped")
+    return 0
+
+
+def run_audit(args: argparse.Namespace) -> int:
+    entries: List[Dict[str, Any]] = []
+    if HISTORY_FILE.exists():
+        with HISTORY_FILE.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict):
+                        entries.append(row)
+                except json.JSONDecodeError:
+                    continue
+    else:
+        append_history(
+            {
+                "source": "audit",
+                "kind": "audit_info",
+                "message": "history.jsonl was not found; generating an empty report",
+            }
+        )
+
+    entries.sort(key=lambda x: str(x.get("timestamp", "")))
+
+    timeline: List[Tuple[str, str, str]] = []
+    violations: List[Tuple[str, str, str]] = []
+    prev_mode: Optional[str] = None
+    prev_chaos: Optional[int] = None
+
+    for row in entries:
+        ts = str(row.get("timestamp", ""))
+        kind = str(row.get("kind", ""))
+
+        if kind == "mode_change":
+            timeline.append((ts, "Mode Change", f"{row.get('from', 'unknown')} -> {row.get('to', 'unknown')}"))
+
+        mode = row.get("mode")
+        if isinstance(mode, str) and mode:
+            if prev_mode is None:
+                prev_mode = mode
+            elif mode != prev_mode:
+                timeline.append((ts, "Mode Observed", f"{prev_mode} -> {mode}"))
+                prev_mode = mode
+
+        chaos = row.get("chaos_active")
+        if isinstance(chaos, int):
+            if prev_chaos is None:
+                prev_chaos = chaos
+            elif chaos != prev_chaos:
+                if chaos == 0:
+                    timeline.append((ts, "Chaos Recovered", "chaos_active reset to 0"))
+                elif chaos == 1:
+                    timeline.append((ts, "Chaos Injected", "slow mode activated"))
+                elif chaos == 2:
+                    timeline.append((ts, "Chaos Injected", "error mode activated"))
+                prev_chaos = chaos
+
+        if kind == "policy_check":
+            result = row.get("result", {})
+            if isinstance(result, dict) and not bool(result.get("allow", False)):
+                domain = str(result.get("domain", row.get("domain", "unknown")))
+                reasons = "; ".join([str(r) for r in result.get("reasons", [])])
+                violations.append((ts, domain, reasons or "Denied without reason"))
+
+        if kind in {"opa_error", "metrics_error", "scrape_error"}:
+            violations.append((ts, kind, str(row.get("message", ""))))
+
+        for sig in row.get("policies", []) if isinstance(row.get("policies"), list) else []:
+            if isinstance(sig, dict) and not bool(sig.get("allow", False)):
+                domain = str(sig.get("domain", "unknown"))
+                reasons = "; ".join([str(r) for r in sig.get("reasons", [])])
+                violations.append((ts, domain, reasons or "Policy failed"))
+
+    lines = [
+        "# SwiftDeploy Audit Report",
+        "",
+        f"Generated at: {utc_now()}",
+        "",
+        "## Timeline",
+        "",
+        "| Timestamp (UTC) | Event | Summary |",
+        "| --- | --- | --- |",
+    ]
+
+    if timeline:
+        for ts, event, summary in timeline:
+            lines.append(f"| {ts} | {event} | {summary} |")
+    else:
+        lines.append("| - | - | No mode or chaos events recorded |")
+
+    lines.extend(
+        [
+            "",
+            "## Policy Violations",
+            "",
+            "| Timestamp (UTC) | Policy/Source | Details |",
+            "| --- | --- | --- |",
+        ]
+    )
+
+    if violations:
+        for ts, domain, details in violations:
+            lines.append(f"| {ts} | {domain} | {details} |")
+    else:
+        lines.append("| - | - | No policy violations recorded |")
+
+    AUDIT_REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Generated {AUDIT_REPORT.name}")
     return 0
 
 
@@ -346,6 +993,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init", help="Generate nginx.conf and docker-compose.yml from manifest")
     subparsers.add_parser("validate", help="Run pre-flight checks")
     subparsers.add_parser("deploy", help="Initialize and deploy the stack")
+
+    status = subparsers.add_parser("status", help="Live metrics and policy dashboard")
+    status.add_argument("--interval", type=int, default=2, help="Scrape interval in seconds")
+    status.add_argument("--samples", type=int, default=0, help="Number of refresh cycles (0 runs until interrupted)")
+
+    subparsers.add_parser("audit", help="Generate audit report from history.jsonl")
 
     promote = subparsers.add_parser("promote", help="Promote deployment mode")
     promote.add_argument("mode", choices=["stable", "canary"], help="Target deployment mode")
@@ -364,6 +1017,8 @@ def main() -> int:
         "init": run_init,
         "validate": run_validate,
         "deploy": run_deploy,
+        "status": run_status,
+        "audit": run_audit,
         "promote": run_promote,
         "teardown": run_teardown,
     }

@@ -19,6 +19,21 @@ network:
   name: swiftdeploy-net
   driver_type: bridge
 
+opa:
+  image: openpolicyagent/opa:0.67.1-static
+  host_port: 8181
+  container_name: swiftdeploy-opa
+  restart: unless-stopped
+
+policy:
+  infrastructure:
+    min_disk_free_gb: 10
+    max_cpu_load: 2.0
+  canary_safety:
+    max_error_rate_pct: 1.0
+    max_p99_latency_ms: 500
+    window_seconds: 30
+
 volumes:
   app_logs: swiftdeploy-app-logs
   nginx_logs: swiftdeploy-nginx-logs

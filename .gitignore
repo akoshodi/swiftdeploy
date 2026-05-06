@@ -9,3 +9,6 @@ venv/
 *.log
 nginx.conf
 docker-compose.yml
+policy-data.json
+history.jsonl
+audit_report.md

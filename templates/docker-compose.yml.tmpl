@@ -13,7 +13,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "wget", "-qO", "-", "http://127.0.0.1:${SERVICE_PORT}/healthz"]
+      test: ["CMD", "wget", "-qO", "-", "http://localhost:${SERVICE_PORT}/healthz"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -32,10 +32,6 @@ services:
         condition: service_healthy
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - SETUID
-      - SETGID
     security_opt:
       - no-new-privileges:true
     ports:
@@ -43,6 +39,29 @@ services:
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ${NGINX_LOGS_VOLUME}:/var/log/nginx
+    networks:
+      - swiftdeploy
+
+  opa:
+    image: ${OPA_IMAGE}
+    container_name: ${OPA_CONTAINER}
+    restart: ${OPA_RESTART}
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+      - "/data/policy-data.json"
+    user: "65534:65534"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${OPA_HOST_PORT}:8181"
+    volumes:
+      - ./policies:/policies:ro
+      - ./policy-data.json:/data/policy-data.json:ro
     networks:
       - swiftdeploy
 
