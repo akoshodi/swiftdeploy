@@ -28,6 +28,16 @@ Build the required local image referenced by `manifest.yaml`:
 docker build -t swift-deploy-1-node:latest .
 ```
 
+The image runtime uses only Python standard library modules, so container builds do not depend on downloading Python packages from PyPI.
+
+If your build still fails because Docker itself cannot reach package repositories, retry with host networking:
+
+```bash
+docker build --network=host -t swift-deploy-1-node:latest .
+```
+
+If it still fails, fix Docker DNS on the host (for example by adding DNS servers in `/etc/docker/daemon.json`) and restart Docker.
+
 ## Manifest
 
 The base required fields are present:
@@ -143,13 +153,3 @@ In canary mode, all responses include header `X-Mode: canary`.
 - Service port is not exposed directly to host
 - Traffic routed only through Nginx
 - Named volumes used for logs
-
-## Evidence for Submission
-
-Capture and upload screenshots showing:
-
-- `validate` output
-- `deploy` output
-- `promote` output with `/healthz` confirmation
-- Generated `nginx.conf` and `docker-compose.yml`
-- Nginx access logs output

@@ -12,13 +12,10 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
     && mkdir -p /var/log/swiftdeploy \
     && chown -R appuser:appgroup /var/log/swiftdeploy /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
 COPY app ./app
 
 USER appuser
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "gunicorn --workers 2 --bind 0.0.0.0:${APP_PORT} app.main:app --access-logfile /var/log/swiftdeploy/access.log --error-logfile /var/log/swiftdeploy/error.log"]
+CMD ["python", "-m", "app.main"]

@@ -183,6 +183,8 @@ def check_nginx_syntax(manifest: Dict) -> Tuple[bool, str]:
                     "docker",
                     "run",
                     "--rm",
+                    "--add-host",
+                    "app:127.0.0.1",
                     "-v",
                     f"{temp_path}:/etc/nginx/nginx.conf:ro",
                     str(manifest["nginx"]["image"]),
