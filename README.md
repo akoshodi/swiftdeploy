@@ -26,8 +26,11 @@ python -m pip install -r requirements.txt
 Build the required local image referenced by `manifest.yaml`:
 
 ```bash
-docker build -t swift-deploy-1-node:latest .
+chmod +x scripts/docker-preflight.sh
+make docker-build
 ```
+
+This runs a preflight check first to confirm Docker containers can resolve and reach PyPI. If DNS/networking is broken, it fails early with guidance before running the image build.
 
 ## Manifest
 
