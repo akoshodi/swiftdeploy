@@ -32,6 +32,14 @@ make docker-build
 
 This runs a preflight check first to confirm Docker containers can resolve and reach PyPI. If DNS/networking is broken, it fails early with guidance before running the image build.
 
+Fallback while troubleshooting Docker DNS/firewall:
+
+```bash
+make docker-build-host
+```
+
+This builds with host networking (`docker build --network=host ...`) and skips the preflight gate so you can keep moving while fixing container egress.
+
 ## Manifest
 
 Base required fields (kept as requested):
